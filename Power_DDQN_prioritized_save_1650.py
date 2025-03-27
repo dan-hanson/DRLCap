@@ -65,56 +65,77 @@ STEPS = 2000
 
 
 
-# get state
+# %% RL STATE FUNCTION — Collect GPU Telemetry and Convert to Discrete RL Input
+
 def state():
+    # Query GPU telemetry and write to CSV
     os.system(
-        'nvidia-smi --format=csv,noheader,nounits --filename=state.csv  --query-gpu=power.draw,clocks.current.graphics,utilization.gpu,utilization.memory,temperature.gpu')
+        'nvidia-smi --format=csv,noheader,nounits --filename=state.csv '
+        '--query-gpu=power.draw,clocks.current.graphics,utilization.gpu,utilization.memory,temperature.gpu')
+    
+    # Sleep to allow telemetry query to finish
     os.system('sleep 0.3')
+    
+    # Read the single-line CSV output
     with open('state.csv', 'r') as fo:
         states_lines = fo.readlines()
         for states in states_lines:
-            states = states.replace(',', '')
-            power_gpu = float(states.split()[0])
-            clock_gpu = float(states.split()[1])
-            util_gpu = float(states.split()[2])
-            util_memory = float(states.split()[3])
-            temp = float(states.split()[4])
+            states = states.replace(',', '')  # remove CSV commas
+            power_gpu      = float(states.split()[0])
+            clock_gpu      = float(states.split()[1])
+            util_gpu       = float(states.split()[2])
+            util_memory    = float(states.split()[3])
+            temp           = float(states.split()[4])
 
+    # Compose telemetry dictionary
     stats = {
-        'GPUL': gpu_limit,
+        'GPUL': gpu_limit,               # Power cap
         'CLOCKS_GPU': clock_gpu,
         'UTIL_GPU': util_gpu,
         'UTIL_MEM': util_memory,
         'POWER': power_gpu,
-        'TEMP': temp}
-    print(stats)
+        'TEMP': temp
+    }
 
-    # GPU states
-    gpu_all_mins = np.array([MINS[k] for k in GPU_LABELS], dtype=np.double)
-    gpu_all_maxs = np.array([MAXS[k] for k in GPU_LABELS], dtype=np.double)
-    gpu_num_buckets = np.array([BUCKETS[k] for k in GPU_LABELS], dtype=np.double)
-    gpu_widths = np.divide(np.array(gpu_all_maxs) - np.array(gpu_all_mins), gpu_num_buckets)  # divide /
+    print("Raw stats:", stats)
 
-    gpu_raw_no_pow = [stats[k] for k in GPU_LABELS]  # wym modify
-    gpu_raw_no_pow = np.clip(gpu_raw_no_pow, gpu_all_mins, gpu_all_maxs)  # clip set data at range(min max)
+    # ---------------------------------------
+    # Normalize + Bucketize the 4 main features
+    # ---------------------------------------
+    gpu_all_mins     = np.array([MINS[k] for k in GPU_LABELS], dtype=np.double)
+    gpu_all_maxs     = np.array([MAXS[k] for k in GPU_LABELS], dtype=np.double)
+    gpu_num_buckets  = np.array([BUCKETS[k] for k in GPU_LABELS], dtype=np.double)
 
-    gpu_raw_floored = gpu_raw_no_pow - gpu_all_mins
-    gpu_state = np.divide(gpu_raw_floored, gpu_widths)
-    gpu_state = np.clip(gpu_state, 0, gpu_num_buckets - 1)
+    # Bucket width = range / number of buckets
+    gpu_widths = np.divide(gpu_all_maxs - gpu_all_mins, gpu_num_buckets)
 
-    gpu_state = np.append(gpu_state,
-                          [clock_gpu_bucket[stats['CLOCKS_GPU']]])  # Add SM frequency index to end of state:
+    # Collect current raw values
+    gpu_raw_values = [stats[k] for k in GPU_LABELS]
+    gpu_clipped    = np.clip(gpu_raw_values, gpu_all_mins, gpu_all_maxs)
+    
+    # Convert to relative position within bucket range
+    gpu_floored    = gpu_clipped - gpu_all_mins
+    gpu_state      = np.divide(gpu_floored, gpu_widths)
+    gpu_state      = np.clip(gpu_state, 0, gpu_num_buckets - 1)
+
+    # Optional: Add clock frequency bucket index (currently unused on GTX 1650)
+    if CLOCKS_GPU:
+        gpu_state = np.append(gpu_state, [clock_gpu_bucket.get(stats['CLOCKS_GPU'], 0)])
+
+    # Optional: Add power cap index to state vector
     if POWER_IN_STATE:
-        # Add power cap index to end of state:
         gpu_state = np.append(gpu_state, [gpu_to_bucket[stats['GPUL']]])
 
-    # Convert floats to integer bucket indices and return:
+    # Convert all floats to integers (bucket IDs)
     gpu_state = [int(x) for x in gpu_state]
-    print("gpu_state: ", gpu_state)
+
+    print("Discrete gpu_state:", gpu_state)
+
     return gpu_state, stats
 
 
-# DDQN with priori
+
+# %% DDQN Prioritized Replay - SumTree Implementation
 np.random.seed(1)
 tf.set_random_seed(1)
 print(tf.__version__)
@@ -176,46 +197,76 @@ class SumTree(object):
         return self.tree[0]  # the root
 
 
-class Memory(object):  # stored as ( s, a, r, s_ ) in SumTree
-    epsilon = 0.01  # small amount to avoid zero priority
-    alpha = 0.6  # [0~1] convert the importance of TD error to priority
-    beta = 0.4  # importance-sampling, from initial value increasing to 1
+# %% DDQN Prioritized Experience Replay Buffer
+class Memory(object):
+    """
+    Stores transitions as (s, a, r, s') in a SumTree.
+    Provides sampling based on TD error priority.
+    """
+
+    # Priority hyperparameters
+    epsilon = 0.01       # Small constant to avoid zero priority
+    alpha = 0.6          # [0 ~ 1]: How much TD-error affects priority (0 = uniform, 1 = full prioritization)
+    beta = 0.4           # Importance-sampling bias correction (increases over time)
     beta_increment_per_sampling = 0.001
-    abs_err_upper = 1.  # clipped abs error
+    abs_err_upper = 1.0  # Clip max TD-error for stability
 
     def __init__(self, capacity):
         self.tree = SumTree(capacity)
 
     def store(self, transition):
+        """
+        Store a new experience with the current max priority.
+        """
         max_p = np.max(self.tree.tree[-self.tree.capacity:])
         if max_p == 0:
             max_p = self.abs_err_upper
-        self.tree.add(max_p, transition)  # set the max p for new p
+        self.tree.add(max_p, transition)
 
     def sample(self, n):
-        b_idx, b_memory, ISWeights = np.empty((n,), dtype=np.int32), np.empty((n, self.tree.data[0].size)), np.empty(
-            (n, 1))
-        pri_seg = self.tree.total_p / n  # priority segment
-        self.beta = np.min([1., self.beta + self.beta_increment_per_sampling])  # max = 1
+        """
+        Sample a batch of experiences, using priority-based stratified sampling.
+        Returns indices, memory batch, and importance-sampling (IS) weights.
+        """
+        b_idx = np.empty((n,), dtype=np.int32)
+        b_memory = np.empty((n, self.tree.data[0].size))
+        ISWeights = np.empty((n, 1))
 
-        min_prob = np.min(self.tree.tree[-self.tree.capacity:]) / self.tree.total_p  # for later calculate ISweight
+        # Segment total priority into n regions
+        pri_seg = self.tree.total_p / n
+
+        # Gradually increase bias correction over time
+        self.beta = np.min([1.0, self.beta + self.beta_increment_per_sampling])
+
+        # Find smallest probability (for normalization)
+        min_prob = np.min(self.tree.tree[-self.tree.capacity:]) / self.tree.total_p
+
         for i in range(n):
             a, b = pri_seg * i, pri_seg * (i + 1)
             v = np.random.uniform(a, b)
             idx, p, data = self.tree.get_leaf(v)
+
             prob = p / self.tree.total_p
             ISWeights[i, 0] = np.power(prob / min_prob, -self.beta)
-            b_idx[i], b_memory[i, :] = idx, data
+
+            b_idx[i] = idx
+            b_memory[i, :] = data
+
         return b_idx, b_memory, ISWeights
 
     def batch_update(self, tree_idx, abs_errors):
-        abs_errors += self.epsilon  # convert to abs and avoid 0
+        """
+        Update priorities in the tree using new TD-errors.
+        """
+        abs_errors += self.epsilon  # Avoid 0 probability
         clipped_errors = np.minimum(abs_errors, self.abs_err_upper)
         ps = np.power(clipped_errors, self.alpha)
+
         for ti, p in zip(tree_idx, ps):
             self.tree.update(ti, p)
 
 
+# %% DDQN Agent with Prioritized Replay
 class DQNPrioritizedReplay:
     def __init__(
             self,
@@ -264,6 +315,7 @@ class DQNPrioritizedReplay:
         self.cost_his = []
 
     def _build_net(self):
+        # Shared layer-building helper
         def build_layers(s, c_names, n_l1, w_initializer, b_initializer, trainable):
             with tf.variable_scope('l1'):
                 w1 = tf.get_variable('w1', [self.n_features, n_l1], initializer=w_initializer, collections=c_names,
@@ -284,12 +336,14 @@ class DQNPrioritizedReplay:
         self.q_target = tf.placeholder(tf.float32, [None, self.n_actions], name='Q_target')  # for calculating loss
         if self.prioritized:
             self.ISWeights = tf.placeholder(tf.float32, [None, 1], name='IS_weights')
+        # Evaluation network
         with tf.variable_scope('eval_net'):
             c_names, n_l1, w_initializer, b_initializer = \
                 ['eval_net_params', tf.GraphKeys.GLOBAL_VARIABLES], 20, \
                 tf.random_normal_initializer(0., 0.3), tf.constant_initializer(0.1)  # config of layers
             self.q_eval = build_layers(self.s, c_names, n_l1, w_initializer, b_initializer, True)
 
+        # Loss and optimizer
         with tf.variable_scope('loss'):
             if self.prioritized:
                 self.abs_errors = tf.reduce_sum(tf.abs(self.q_target - self.q_eval), axis=1)  # for updating Sumtree
@@ -394,30 +448,29 @@ with tf.variable_scope('DQN_with_prioritized_replay'):
     RL = DQNPrioritizedReplay(
         n_actions=len(GPU)
     )
-
+# Get initial observation and state
 obeservation, states = state()
-# while True:
+
 for step in range(STEPS):
-    # RL choose action based on observation
     action = RL.choose_action(np.array(obeservation))
     gpu_limit = GPU[action]
     print('power cap:', gpu_limit)
-    os.system("echo JQX_ard_1234  | sudo -S nvidia-smi -pl %s " % (gpu_limit))  # take action
+
+    os.system(f"sudo nvidia-smi -pl {gpu_limit}")  # apply power limit
 
     power_g = math.floor(states['POWER'])
     fre_g = states['CLOCKS_GPU']
 
-    # get next obserbation and reward
+    # Get next observation and calculate reward
     obeservation_, states_ = state()
     power_g_ = math.floor(states_['POWER'])
     fre_g_ = states_['CLOCKS_GPU']
-    util_g_ = states_['UTIL_GPU']
-    util_m_ = states_['UTIL_MEM']
 
     power = power_g_ - power_g
     fre = fre_g_ - fre_g
-    print('power :', power, fre)
+    print('power:', power, 'freq delta:', fre)
 
+    # Reward logic (unchanged)
     if power <= 0:
         if -45 <= fre:
             reward = 5
@@ -425,43 +478,44 @@ for step in range(STEPS):
             reward = -1
         elif -135 <= fre < -90:
             reward = -2
-        elif fre < -135:
+        else:
             reward = -3
-    if power > 0:
+    else:
         if fre <= 45:
             reward = -1
         elif 45 < fre <= 90:
             reward = -2
         elif 90 < fre <= 135:
             reward = -3
-        elif fre > 135:
+        else:
             reward = -4
 
-    print('reward : ', reward)
+    print('reward:', reward)
 
+    # Store and learn
     RL.store_transition(obeservation, action, reward, obeservation_)
 
-    if (step > MEMORY_SIZE):
+    if step > MEMORY_SIZE:
         RL.learn()
 
-    # swap observation
+    # Update current state
     states = states_
     obeservation = obeservation_
+
     print('step-----------------:', step)
-    print('\n')
+    print()
 
-# saver.save(sess, 'my_test_model',global_step=1000)
-
-# start 12/7/21
-# 存储神经网络变量
+# Save model
 print('Uninitialized variables:')
 print(sess.run(tf.report_uninitialized_variables()))
-saver = tf.train.Saver()
-save_path = saver.save(sess, '/home/wym/project/cpu_gpu/gpu/rl/net-power/save_net.ckpt')
-print('Save to path: ', save_path)
-# 存储神经网络框架
-model_path = saver.save(sess, '/home/wym/project/cpu_gpu/gpu/rl/net-power/model')
-print('Save model to path: ', model_path)
 
-os.system("echo JQX_ard_1234 | sudo -S nvidia-smi -pl 250")
+saver = tf.train.Saver()
+save_path = saver.save(sess, './results/checkpoints/save_net.ckpt')
+print('Saved to:', save_path)
+
+model_path = saver.save(sess, './results/models/final_model')
+print('Saved model to:', model_path)
+
+# Reset power cap to default
+os.system("sudo nvidia-smi -pl 75")  # default for 1650
 print('end')
