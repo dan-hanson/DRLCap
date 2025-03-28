@@ -47,7 +47,7 @@ POWER_IN_STATE = 0  # Whether to include power cap as an RL state (disabled)
 # -----------------------------
 # Action Space: Power limits between 35W and 75W
 # -----------------------------
-GPU = range(35, 76, 1)
+GPU = range(45, 76, 1)
 gpu_to_bucket = {GPU[i]: i for i in range(len(GPU))}
 
 # -----------------------------
@@ -61,7 +61,7 @@ REWARD_DECAY = 0.95
 REPLACE_TARGET_ITER = 10
 MEMORY_SIZE = 1000
 BATCH_SIZE = 32
-STEPS = 20
+STEPS = 5
 
 
 
@@ -506,16 +506,26 @@ for step in range(STEPS):
     print()
 
 # Save model
+print('\n=== Saving Model ===')
 print('Uninitialized variables:')
 print(sess.run(tf.report_uninitialized_variables()))
 
 saver = tf.train.Saver()
-save_path = saver.save(sess, './results/checkpoints/save_net.ckpt')
-print('Saved to:', save_path)
 
-model_path = saver.save(sess, './results/models/final_model')
-print('Saved model to:', model_path)
+# Save checkpoint
+checkpoint_path = os.path.join('results', 'checkpoints', 'save_net.ckpt')
+os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+save_path = saver.save(sess, checkpoint_path)
+print(f'Checkpoint saved to: {save_path}')
 
-# Reset power cap to default
+# Save final model
+model_dir = os.path.join('results', 'models')
+os.makedirs(model_dir, exist_ok=True)
+model_path = saver.save(sess, os.path.join(model_dir, 'final_model'))
+print(f'Model saved to: {model_path}')
+
+# Reset power cap
+print('\n=== Resetting Power Cap ===')
 os.system("sudo nvidia-smi -pl 75")  # default for 1650
-print('end')
+print('Power cap reset to 75W.')
+print('=== Done ===\n')
